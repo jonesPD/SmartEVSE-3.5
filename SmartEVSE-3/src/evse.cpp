@@ -968,10 +968,6 @@ char IsCurrentAvailable(void) {
         _LOG_D("No current available MaxSumMains line %d. ActiveEVSE=%i, MinCurrent=%iA, Isum=%.1fA, MaxSumMains=%iA.\n", __LINE__, ActiveEVSE, MinCurrent,  (float)Isum/10, MaxSumMains);
         return 0;                                                           // Not enough current available!, return with error
     }
-    if (GridRelayOpen && ((Phases * ActiveEVSE * MinCurrent * 10) + Isum > 3 * GridRelayMaxSumMains * 10)) { // the GridRelayMaxSumMains is allowed on all 3 phases
-        _LOG_D("No current available GridRelay line %d. ActiveEVSE=%i, MinCurrent=%iA, Isum=%.1fA, GridRelayMaxSumMains=%iA.\n", __LINE__, ActiveEVSE, MinCurrent,  (float)Isum/10, GridRelayMaxSumMains);
-        return 0;                                                           // Not enough current available!, return with error
-    }
 
 // Use OCPP Smart Charging if Load Balancing is turned off
 #if ENABLE_OCPP
@@ -990,7 +986,8 @@ char IsCurrentAvailable(void) {
 
 // Set global var Nr_Of_Phases_Charging
 // 0 = undetected, 1 - 3 nr of phases we are charging
-void Set_Nr_of_Phases_Charging(void) {
+// returns nr of phases we are charging, and 3 if undetected
+int Set_Nr_of_Phases_Charging(void) {
     uint32_t Max_Charging_Prob = 0;
     uint32_t Charging_Prob=0;                                        // Per phase, the probability that Charging is done at this phase
     Nr_Of_Phases_Charging = 0;
@@ -1042,6 +1039,9 @@ void Set_Nr_of_Phases_Charging(void) {
     }
 
     _LOG_A("Charging at %i phases.\n", Nr_Of_Phases_Charging);
+    if (Nr_Of_Phases_Charging == 0)
+        return 3;
+    return Nr_Of_Phases_Charging;
 }
 
 // Calculates Balanced PWM current for each EVSE
@@ -1187,9 +1187,9 @@ void CalcBalancedCurrent(char mod) {
     if ((LoadBl == 0 && EVMeter.Type && Mode != MODE_NORMAL) || LoadBl == 1)    // Conditions in which MaxCircuit has to be considered
         IsetBalanced = min((int) IsetBalanced, (MaxCircuit * 10) - Baseload_EV); //limiting is per phase so no Nr_Of_Phases_Charging here!
     // guard GridRelay
-    if (GridRelayOpen)
-        IsetBalanced = min((int) IsetBalanced, ((GridRelayMaxSumMains * 10) - Isum)/3); //assume the current should be available on all 3 phases
-
+    if (GridRelayOpen) {
+        IsetBalanced = min((int) IsetBalanced, (GridRelayMaxSumMains * 10)/Set_Nr_of_Phases_Charging()); //assume the current should be available on all 3 phases
+    }
     _LOG_V("Checkpoint 4 Isetbalanced=%.1f A.\n", (float)IsetBalanced/10);
 
     // ############### the rest of the work we only do if there are ActiveEVSEs #################
@@ -2037,11 +2037,17 @@ void CalcIsum(void) {
 
 // CheckSwitch (SW input)
 //
-void CheckSwitch(void)
+void CheckSwitch(bool force = false)
 {
-    static uint8_t RB2count = 0, RB2last = 1, RB2low = 0;
+    static uint8_t RB2count = 0, RB2last = 2, RB2low = 0;
     static unsigned long RB2Timer = 0;                                                 // 1500ms
 
+    if (force)                                                                  // force to read switch position
+        RB2last = 2;
+
+    if ((RB2last == 2) && (Switch == 1 || Switch == 3))                         // upon initialization we want the toggle switch to be read
+        RB2last = 1;                                                            // but not the push buttons, because this would toggle the state
+                                                                                // upon reboot
     // External switch changed state?
     if ( (digitalRead(PIN_SW_IN) != RB2last) || RB2low) {
         // make sure that noise on the input does not switch
