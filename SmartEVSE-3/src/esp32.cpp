@@ -196,6 +196,7 @@ extern uint16_t OverrideCurrent;
 // Load Balance variables
 extern int16_t IsetBalanced;
 extern uint16_t Balanced[NR_EVSES];
+extern AccessStatus_t Access[NR_EVSES];
 #if SMARTEVSE_VERSION < 40 //v3
 extern uint16_t BalancedMax[NR_EVSES];
 extern uint8_t BalancedState[NR_EVSES];
@@ -425,6 +426,13 @@ const char * getStateName(uint8_t StateCode) {
     else return "NOSTATE";
 }
 
+const char * getAccessName(AccessStatus_t AccessCode) {
+    return AccessCode == OFF ? "Deny" : AccessCode == ON ? "Allow" : AccessCode == PAUSE ? "Pause" : "N/A";
+}
+
+const char * getModeName(AccessStatus_t AccessCode, uint8_t ModeCode) {
+    return AccessCode == OFF ? "Off" : AccessCode == PAUSE ? "Pause" : ModeCode > 3 ? "N/A" : StrMode[ModeCode];
+}
 
 const char * getStateNameWeb(uint8_t StateCode) {
     if(StateCode < 15) return StrStateNameWeb[StateCode];
@@ -721,8 +729,65 @@ void mqtt_receive_callback(const String topic, const String payload) {
                 EnableC2 = (EnableC2_t) value;
         }
         write_settings();
+    } else if (LoadBl == 1) { // check slaves, for example MQTTprefix + "/Set/Slave-1/Mode"
+        
+        int16_t slaveTopicLength = topic.length() - (MQTTprefix.length() + 1+3+1+5+1+1+1);
+        _LOG_I("topic %s [%i]\n", topic.c_str(), slaveTopicLength);
+        
+        char prefix[20];
+        char slaveTopic[20];
+        int slaveNodeNr;
+        
+        strncpy(prefix, topic.c_str() + MQTTprefix.length() + 1+3+1+5+1, 1);
+        prefix[1] = '\0';
+        sscanf(prefix, "%d", &slaveNodeNr);
+        
+        strncpy(slaveTopic, topic.c_str() + MQTTprefix.length() + 1+3+1+5+1+1+1, slaveTopicLength);
+        slaveTopic[slaveTopicLength] = '\0';
+        
+        _LOG_I("slave No %s [%d]; slave topic %s\n", prefix, slaveNodeNr, slaveTopic);
+        _LOG_I("before-master Access=%s,Mode=%s; slave [%d] Access=%s,Mode=%s;\n", getAccessName(AccessStatus), getModeName(AccessStatus, Mode), slaveNodeNr, getAccessName(Node[slaveNodeNr].Access), getModeName(Node[slaveNodeNr].Access, Node[slaveNodeNr].Mode));
+        
+        if (slaveNodeNr > 0 and slaveNodeNr < NR_EVSES+1) {
+            if (String(slaveTopic) == "Mode") {
+                if (payload == "Off") {
+                    Access[slaveNodeNr] = OFF;
+                    if (BalancedState[slaveNodeNr] == STATE_C) BalancedState[slaveNodeNr] = STATE_COMM_C;                               // Determine where to switch to.
+                    else if (BalancedState[slaveNodeNr] != STATE_C1 && (BalancedState[slaveNodeNr] == STATE_B || BalancedState[slaveNodeNr] == STATE_MODEM_REQUEST || BalancedState[slaveNodeNr] == STATE_MODEM_WAIT || BalancedState[slaveNodeNr] == STATE_MODEM_DONE || BalancedState[slaveNodeNr] == STATE_MODEM_DENIED)) BalancedState[slaveNodeNr] = STATE_COMM_B;
+                    Balanced[slaveNodeNr] = 0;
+                } else if (payload == "Normal" && Mode == MODE_NORMAL) { // this allows to change slave from OFF to ON, independently from Master - as long as remain in same Mode
+                    if (Access[slaveNodeNr] != ON) {
+                        Balanced[slaveNodeNr] = 0;
+                    }
+                    Access[slaveNodeNr] = ON;
+                    Node[slaveNodeNr].Mode = MODE_NORMAL;
+                } else if (payload == "Solar" && Mode == MODE_SOLAR) { // this allows to change slave from OFF to ON, independently from Master - as long as remain in same Mode
+                    if (Access[slaveNodeNr] != ON) {
+                        Balanced[slaveNodeNr] = 0;
+                    }
+                    Access[slaveNodeNr] = ON;
+                    Node[slaveNodeNr].Mode = MODE_SOLAR;
+                } else if (payload == "Smart" && Mode == MODE_SMART) { // this allows to change slave from OFF to ON, independently from Master - as long as remain in same Mode
+                    if (Access[slaveNodeNr] != ON) {
+                        Balanced[slaveNodeNr] = 0;
+                    }
+                    Access[slaveNodeNr] = ON;
+                    Node[slaveNodeNr].Mode = MODE_SMART;
+                } else if (payload == "Pause") {
+                    Access[slaveNodeNr] = PAUSE;
+                    if (BalancedState[slaveNodeNr] == STATE_C) BalancedState[slaveNodeNr] = STATE_COMM_C;                               // Determine where to switch to.
+                    else if (BalancedState[slaveNodeNr] != STATE_C1 && (BalancedState[slaveNodeNr] == STATE_B || BalancedState[slaveNodeNr] == STATE_MODEM_REQUEST || BalancedState[slaveNodeNr] == STATE_MODEM_WAIT || BalancedState[slaveNodeNr] == STATE_MODEM_DONE || BalancedState[slaveNodeNr] == STATE_MODEM_DENIED)) BalancedState[slaveNodeNr] = STATE_COMM_B;
+                    Balanced[slaveNodeNr] = 0; 
+                }
+            } else if (String(slaveTopic) == "ChargeCurrentOverride") {
+                // currently overriding charge current on nodes is not supported????
+                BalancedMax[slaveNodeNr] = payload.toInt(); 
+            } 
+            processAllNodeStates(slaveNodeNr); 
+        }
+        
+        _LOG_I("after-master Access=%s,Mode=%s; slave [%d] Access=%s,Mode=%s;\n", getAccessName(AccessStatus), getModeName(AccessStatus, Mode), slaveNodeNr, getAccessName(Access[slaveNodeNr]), getModeName(Access[slaveNodeNr], Node[slaveNodeNr].Mode));
     }
-
     // Make sure MQTT updates directly to prevent debounces
     lastMqttUpdate = 10;
 }
@@ -870,6 +935,35 @@ void SetupMQTTClient() {
     optional_payload = MQTTclient.jsna("cablelock_topic", String(MQTTprefix + "/CableLock")) + MQTTclient.jsna("command_topic", String(MQTTprefix + "/Set/CableLock"));
     optional_payload += String(R"(, "options" : ["0", "1"])");
     MQTTclient.announce("Cable Lock", "select", optional_payload);
+
+    //set the parameters for and MQTTclient.announce slaves (if master and load balancing is active)
+    if (LoadBl == 1) {
+        uint8_t n = 1;
+        while (n < NR_EVSES) {
+            if (Node[n].Online) {
+                optional_payload = "";
+                MQTTclient.announce("Slave-" + String(n) + "/EV Plug State", "sensor", optional_payload);
+                MQTTclient.announce("Slave-" + String(n) + "/State", "sensor", optional_payload);
+                MQTTclient.announce("Slave-" + String(n) + "/Access", "sensor", optional_payload);
+                
+                optional_payload = MQTTclient.jsna("state_topic", String("/Slave-" + String(n) + "/Mode")) + MQTTclient.jsna("command_topic", String(MQTTprefix + "/Set/Slave-" + String(n) + "/Mode"));
+                optional_payload += String(R"(, "options" : ["Off", "Normal", "Smart", "Solar", "Pause"])");
+                MQTTclient.announce("Slave-" + String(n) + "/Mode", "select", optional_payload);
+                
+                optional_payload = MQTTclient.jsna("entity_category","diagnostic");
+                MQTTclient.announce("Slave-" + String(n) + "/Error", "sensor", optional_payload);
+                
+                String optional_payload = MQTTclient.jsna("device_class","current") + MQTTclient.jsna("state_class","measurement") + MQTTclient.jsna("unit_of_measurement","A") + MQTTclient.jsna("value_template", R"({{ value | int / 10 }})");
+                MQTTclient.announce("Slave-" + String(n) + "/ChargeCurrent", "sensor", optional_payload);
+
+                optional_payload = MQTTclient.jsna("command_topic", String(MQTTprefix + "/Set/Slave-" + String(n) + "/CurrentOverride")) + MQTTclient.jsna("min", "0") + MQTTclient.jsna("max", MaxCurrent ) + MQTTclient.jsna("mode","slider");
+                optional_payload += MQTTclient.jsna("value_template", R"({{ value | int / 10 if value | is_number else none }})") + MQTTclient.jsna("command_template", R"({{ value | int * 10 }})");
+                MQTTclient.announce("Slave-" + String(n) + "/ChargeCurrentOverride", "number", optional_payload);
+            } 
+            n++;
+        }
+    }
+
 }
 
 void mqttPublishData() {
@@ -941,6 +1035,36 @@ void mqttPublishData() {
         if (Lock != 0) {
             MQTTclient.publish(MQTTprefix + "/CableLock", CableLock, true, 0);
         }
+
+        // publish slave-node parameters if master and load balancing is active
+        if (LoadBl == 1) {
+            uint8_t n = 1;
+            while (n < NR_EVSES) {
+                if (Node[n].Online) {
+                    MQTTclient.publish(MQTTprefix + "/Slave-" + String(n) + "/connected", "online", true, 0);
+                    MQTTclient.publish(MQTTprefix + "/Slave-" + String(n) + "/Mode", getModeName(Node[n].Access, Node[n].Mode), true, 0);
+                    
+                    MQTTclient.publish(MQTTprefix + "/Slave-" + String(n) + "/State", getStateNameWeb(BalancedState[n]), true, 0);
+                    MQTTclient.publish(MQTTprefix + "/Slave-" + String(n) + "/Access", getAccessName(Node[n].Access), true, 0);
+
+                    MQTTclient.publish(MQTTprefix + "/Slave-" + String(n) + "/Error", getErrorNameWeb(BalancedError[n]), true, 0);
+                    MQTTclient.publish(MQTTprefix + "/Slave-" + String(n) + "/EVPlugState", (BalancedState[n] != STATE_A) ? "Connected" : "Disconnected", true, 0);
+                    MQTTclient.publish(MQTTprefix + "/Slave-" + String(n) + "/ChargeCurrent", Balanced[n], true, 0);
+                    MQTTclient.publish(MQTTprefix + "/Slave-" + String(n) + "/ChargeCurrentOverride", BalancedMax[n], true, 0);
+                } 
+                else {
+                    MQTTclient.publish(MQTTprefix + "/Slave-" + String(n) + "/connected", "offline", true, 0);
+                    MQTTclient.publish(MQTTprefix + "/Slave-" + String(n) + "/Mode", "N/A", false, 0);
+                    MQTTclient.publish(MQTTprefix + "/Slave-" + String(n) + "/State", "N/A", false, 0);
+                    MQTTclient.publish(MQTTprefix + "/Slave-" + String(n) + "/Error", "N/A", false, 0);
+                    MQTTclient.publish(MQTTprefix + "/Slave-" + String(n) + "/EVPlugState", 0, false, 0);
+                    MQTTclient.publish(MQTTprefix + "/Slave-" + String(n) + "/ChargeCurrent", 0, false, 0);
+                    MQTTclient.publish(MQTTprefix + "/Slave-" + String(n) + "/ChargeCurrentOverride", 0, false, 0);
+                }
+                n++;
+            }
+        }
+    
 }
 #endif
 

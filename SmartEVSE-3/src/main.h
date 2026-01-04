@@ -323,6 +323,8 @@ extern void write_settings(void);
 extern void CalcIsum(void);
 extern void setChargeDelay(uint8_t delay);
 
+extern uint8_t processAllNodeStates(uint8_t NodeNr);
+
 struct Sensorbox {
     uint8_t SoftwareVer;        // Sensorbox 2 software version
     uint8_t WiFiConnected;      // 0:not connected / 1:connected to WiFi
@@ -349,6 +351,7 @@ struct Node_t {
     uint32_t IntTimer;      // 1s
     uint16_t SolarTimer;    // 1s
     uint8_t Mode;
+    AccessStatus_t Access;
 };
 
 extern bool BuzzerPresent;

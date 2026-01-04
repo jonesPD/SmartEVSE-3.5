@@ -185,18 +185,19 @@ uint16_t Balanced[NR_EVSES] = {0, 0, 0, 0, 0, 0, 0, 0};                     // A
 uint16_t BalancedMax[NR_EVSES] = {0, 0, 0, 0, 0, 0, 0, 0};                  // Max Amps value per EVSE
 uint8_t BalancedState[NR_EVSES] = {0, 0, 0, 0, 0, 0, 0, 0};                 // State of all EVSE's 0=not active (state A), 1=charge request (State B), 2= Charging (State C)
 uint16_t BalancedError[NR_EVSES] = {0, 0, 0, 0, 0, 0, 0, 0};                // Error state of EVSE
+AccessStatus_t Access[NR_EVSES] = {ON, ON, ON, ON, ON, ON, ON, ON};                // New access state of EVSE
 
 Node_t Node[NR_EVSES] = {                                                        // 0: Master / 1: Node 1 ...
    /*         Config   EV     EV       Min      Used    Charge Interval Solar *          // Interval Time   : last Charge time, reset when not charging
-    * Online, Changed, Meter, Address, Current, Phases,  Timer,  Timer, Timer, Mode */   // Min Current     : minimal measured current per phase the EV consumes when starting to charge @ 6A (can be lower then 6A)
-    {      1,       0,     0,       0,       0,      0,      0,      0,     0,    0 },   // Used Phases     : detected nr of phases when starting to charge (works with configured EVmeter meter, and might work with sensorbox)
-    {      0,       1,     0,       0,       0,      0,      0,      0,     0,    0 },
-    {      0,       1,     0,       0,       0,      0,      0,      0,     0,    0 },
-    {      0,       1,     0,       0,       0,      0,      0,      0,     0,    0 },    
-    {      0,       1,     0,       0,       0,      0,      0,      0,     0,    0 },
-    {      0,       1,     0,       0,       0,      0,      0,      0,     0,    0 },
-    {      0,       1,     0,       0,       0,      0,      0,      0,     0,    0 },
-    {      0,       1,     0,       0,       0,      0,      0,      0,     0,    0 }            
+    * Online, Changed, Meter, Address, Current, Phases,  Timer,  Timer, Timer, Mode, Access */   // Min Current     : minimal measured current per phase the EV consumes when starting to charge @ 6A (can be lower then 6A)
+    {      1,       0,     0,       0,       0,      0,      0,      0,     0,    0, ON },   // Used Phases     : detected nr of phases when starting to charge (works with configured EVmeter meter, and might work with sensorbox)
+    {      0,       1,     0,       0,       0,      0,      0,      0,     0,    0, ON },
+    {      0,       1,     0,       0,       0,      0,      0,      0,     0,    0, ON },
+    {      0,       1,     0,       0,       0,      0,      0,      0,     0,    0, ON },    
+    {      0,       1,     0,       0,       0,      0,      0,      0,     0,    0, ON },
+    {      0,       1,     0,       0,       0,      0,      0,      0,     0,    0, ON },
+    {      0,       1,     0,       0,       0,      0,      0,      0,     0,    0, ON },
+    {      0,       1,     0,       0,       0,      0,      0,      0,     0,    0, ON }            
 };
 void ModbusRequestLoop(void);
 uint8_t Force_Single_Phase_Charging(void);
@@ -2023,20 +2024,28 @@ void receiveNodeStatus(uint8_t *buf, uint8_t NodeNr) {
 
     BalancedState[NodeNr] = buf[1];                                             // Node State
     BalancedError[NodeNr] = buf[3];                                             // Node Error status
+    
     // Update Mode when changed on Node and not Smart/Solar Switch on the Master
     // Also make sure we are not in the menu.
     Node[NodeNr].Mode = buf[7];
-
     if ((Node[NodeNr].Mode != Mode) && Switch != 4 && !LCDNav && !NodeNewMode) {
         NodeNewMode = Node[NodeNr].Mode + 1;        // Store the new Mode in NodeNewMode, we'll update Mode in 'ProcessAllNodeStates'
 #ifndef SMARTEVSE_VERSION //CH32
         printf("@NodeNewMode:%u.\n", Node[NodeNr].Mode + 1); //CH32 sends new value to ESP32
 #endif
     }
+    // Update Access when changed on Node.
+    Node[NodeNr].Access = (buf[11] == 0 && BalancedState[NodeNr] == STATE_A) ? OFF : (buf[11] == 0 && BalancedState[NodeNr] != STATE_A) ? PAUSE : ON;
+
+    if (Node[NodeNr].Access != Access[NodeNr]) {
+        Access[NodeNr] = Node[NodeNr].Access;
+        _LOG_I("@NodeNewAccess:%s.\n", Node[NodeNr].Access == OFF ? "Deny" : Node[NodeNr].Access == ON ? "Allow" : Node[NodeNr].Access == PAUSE ? "Pause" : "N/A");
+    }
+
     Node[NodeNr].SolarTimer = (buf[8] * 256) + buf[9];
     Node[NodeNr].ConfigChanged = buf[13] | Node[NodeNr].ConfigChanged;
     BalancedMax[NodeNr] = buf[15] * 10;                                         // Node Max ChargeCurrent (0.1A)
-    _LOG_D("ReceivedNode[%u]Status State:%u (%s) Error:%u, BalancedMax:%u, Mode:%u, ConfigChanged:%u.\n", NodeNr, BalancedState[NodeNr], StrStateName[BalancedState[NodeNr]], BalancedError[NodeNr], BalancedMax[NodeNr], Node[NodeNr].Mode, Node[NodeNr].ConfigChanged);
+    _LOG_D("ReceivedNode[%u]Status State:%u (%s) Error:%u, BalancedMax:%u, Mode:%u, ConfigChanged:%u, Access:%u.\n", NodeNr, BalancedState[NodeNr], StrStateName[BalancedState[NodeNr]], BalancedError[NodeNr], BalancedMax[NodeNr], Node[NodeNr].Mode, Node[NodeNr].ConfigChanged, Node[NodeNr].Access);
 }
 
 
@@ -2115,7 +2124,7 @@ void requestPowerMeasurement(uint8_t Meter, uint8_t Address, uint16_t PRegister)
  * @return uint8_t success
  */
 uint8_t processAllNodeStates(uint8_t NodeNr) {
-    uint16_t values[5];
+    uint16_t values[6];
     uint8_t current, write = 0, regs = 2;                                       // registers are written when Node needs updating.
 
     values[0] = BalancedState[NodeNr];
@@ -2145,13 +2154,19 @@ uint8_t processAllNodeStates(uint8_t NodeNr) {
 
         case STATE_COMM_B:                                                      // Request to charge A->B
             _LOG_I("Node %u State A->B request ", NodeNr);
-            if (current) {                                                      // check if we have enough current
+            if (current && Access[NodeNr] == ON) {                       // check if we have enough current
                                                                                 // Yes enough current..
                 BalancedState[NodeNr] = STATE_B;                                // Mark Node EVSE as active (State B)
                 Balanced[NodeNr] = MinCurrent * 10;                             // Initially set current to lowest setting
                 values[0] = STATE_COMM_B_OK;
                 write = 1;
                 _LOG_I("- OK!\n");
+            } else if (Access[NodeNr] != ON) {                           // waiting for MQTT command to start charging (when current available)
+                BalancedState[NodeNr] = STATE_COMM_B;                           // Mark Node EVSE as active (State B)
+                values[0] = STATE_COMM_B;
+                Balanced[NodeNr] = 0;                                           // Make sure the Node does not start charging by setting current to 0
+                write = 1;
+                _LOG_I("- Waiting for OK!\n");
             } else {                                                            // We do not have enough current to start charging
                 Balanced[NodeNr] = 0;                                           // Make sure the Node does not start charging by setting current to 0
                 if ((BalancedError[NodeNr] & LESS_6A) == 0) {                   // Error flags cleared?
@@ -2165,13 +2180,19 @@ uint8_t processAllNodeStates(uint8_t NodeNr) {
         case STATE_COMM_C:                                                      // request to charge B->C
             _LOG_I("Node %u State B->C request\n", NodeNr);
             Balanced[NodeNr] = 0;                                               // For correct baseload calculation set current to zero
-            if (current) {                                                      // check if we have enough current
+            if (current && Access[NodeNr] == ON) {                       // check if we have enough current
                                                                                 // Yes
                 BalancedState[NodeNr] = STATE_C;                                // Mark Node EVSE as Charging (State C)
                 CalcBalancedCurrent(1);                                         // Calculate charge current for all connected EVSE's
                 values[0] = STATE_COMM_C_OK;
                 write = 1;
                 _LOG_I("- OK!\n");
+            } else if (Access[NodeNr] != ON) {                           // waiting for MQTT command to start charging (when current available)
+                BalancedState[NodeNr] = STATE_COMM_C;                           // Mark Node EVSE as active (State B)
+                values[0] = STATE_COMM_C;
+                Balanced[NodeNr] = 0;                                           // Make sure the Node does not start charging by setting current to 0
+                write = 1;
+                _LOG_I("- Waiting for OK!\n");
             } else {                                                            // We do not have enough current to start charging
                 if ((BalancedError[NodeNr] & LESS_6A) == 0) {          // Error flags cleared?
                     BalancedError[NodeNr] |= LESS_6A;                      // Normal or Smart Mode: Not enough current available
@@ -2200,7 +2221,7 @@ uint8_t processAllNodeStates(uint8_t NodeNr) {
     // Error Flags
     values[1] = BalancedError[NodeNr];
     // Charge Current
-    values[2] = 0;                                                              // This does nothing for Nodes. Currently the Chargecurrent can only be written to the Master
+    values[2] = BalancedMax[NodeNr];                                            // ????This does nothing for Nodes. Currently the Chargecurrent can only be written to the Master
     // Mode
     if (Node[NodeNr].Mode != Mode) {
         regs = 4;
@@ -2212,11 +2233,19 @@ uint8_t processAllNodeStates(uint8_t NodeNr) {
     if (abs((int16_t)SolarStopTimer - (int16_t)Node[NodeNr].SolarTimer) > 3) {  // Write SolarStoptimer to Node if time is off by 3 seconds or more.
         regs = 5;
         write = 1;
-        values[4] = SolarStopTimer;
-    }    
+    }
+    values[4] = SolarStopTimer;
+    
+    // Access bit
+    if (Node[NodeNr].Access != Access[NodeNr]) {
+        regs = 6;
+        write = 1;
+        values[5] = Access[NodeNr] == ON ? 1 : 0;
+        Node[NodeNr].Access = Access[NodeNr];
+    }
 
     if (write) {
-        _LOG_D("processAllNode[%u]States State:%u (%s), BalancedError:%u, Mode:%u, SolarStopTimer:%u\n",NodeNr, BalancedState[NodeNr], StrStateName[BalancedState[NodeNr]], BalancedError[NodeNr], Mode, SolarStopTimer);
+        _LOG_D("processAllNode[%u]States State:%u (%s), BalancedError:%u, Mode:%u, SolarStopTimer:%u, Access:%u\n", NodeNr, BalancedState[NodeNr], StrStateName[BalancedState[NodeNr]], BalancedError[NodeNr], Mode, SolarStopTimer, Access[NodeNr]);
         ModbusWriteMultipleRequest(NodeNr+1 , 0x0000, values, regs);            // Write State, Error, Charge Current, Mode and Solar Timer to Node
     }
 
